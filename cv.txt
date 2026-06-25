@@ -1,0 +1,60 @@
+Avior Bouganim
+050-690-1104
+Linkedin
+Ramat Gan, Israel
+aviorbouganim@gmail.com
+
+
+Data driven analyst and Industrial Engineering graduate with a strong analytical mindset and expertise in transforming complex datasets into actionable insights and structured, trustworthy models. Hands on experience building AI driven data automation, advanced SQL, and product oriented dashboards, with a proven track record of cross functional collaboration and process efficiency.
+
+Professional experience
+
+Unilever | Operations Analyst
+2026 - present
+Optimizing procurement and supply chain data using AI tools to drive cost efficiency and data backed business decisions. Built and improved operational reports and dashboards to streamline workflows, while maintaining reliable info on raw materials through SAP. Managing global supplier relationships and participating in negotiations based on global commodity exchange market data.
+
+Alon Unit (Ministry of Defense) | Executive Protection
+2023 - 2026
+Operate under high responsibility and confidentiality while ensuring the safety of high -profile individuals.Conducted real time threat assessments, and collaborated with cross functional teams to ensure the integrity of sensitive operations. security clearance in affect.
+
+Mazal Tale | Operation Specialist
+2018 - 2022
+Drove process improvement and optimized operational workflows and inventory management. Coordinating across multiple teams and managing the technical aspects of live events (Food Industry) to ensure smooth execution and operational excellence.
+
+IDF | Palsar 7 - Combat Warfare Project Management
+2016 - 2018
+Developed and delivered professional training programs.
+Coordinated logistics resources such as equipment, transportation and ammunition, while working with different teams ensuring outstanding workflow. 
+Analyzed field data to improve operational procedures and resource management.
+
+Volunteering
+Beit Ha’Galgalim  | Educational Mentor
+2023 - Present
+Lead educational and social activities for youth with physical disabilities.
+Responsible for schedule planning, budget management, and developing engaging learning programs. Recipient of a scholarship through the F.I.D.F Impact Program.
+
+Education
+2022 - Aug 2026
+Shenkar College
+B.Sc. Industrial Engineering & Management.
+Academic Excellence: Dean’s list for 2 consecutive years.
+GPA: 90
+Graduates on Aogust 26
+
+Tools
+Data & Analytics: SQL, Python (Pandas,NumPy), 
+Excel (XLOOKUP,Pivot Tables), SAP, AI Tools.
+Visualization: Tableau, Power BI, Streamlit.
+AI & Automation: GitHub, Codex, Prompt engineering for code generation.
+
+Projects
+1.FinOps Dashboard
+Built an AI powered FinOps dashboard to monitor organizational AI tools, API usage trends, and token budget performance.
+Designed a responsive React interface with actionable insights and executive level financial visibility. Streamlit ↗.
+
+2.Built an automated system that scrapes jobs daily, filters and scores them using the Claude API across multiple role personas, and tracks the full application pipeline in a custom Streamlit dashboard. GitHub ↗
+
+Languages
+Hebrew: Native
+English: Fluent
+
