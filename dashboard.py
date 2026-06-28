@@ -119,6 +119,24 @@ def job_date(entry: dict) -> str:
     return tracking(entry).get("first_seen", "1970-01-01")
 
 
+def classify_title(entry: dict) -> str:
+    """Keyword-based job type label. Uses detected_persona if stored, otherwise
+    derives it from the title. Returns a display-friendly string."""
+    LABELS = {
+        "data_analyst":    "📊 Data / BI",
+        "product_manager": "🧩 Product",
+        "project_manager": "📋 Project / PMO",
+        "operations":      "⚙️ Operations",
+        "other":           "🔗 Other",
+    }
+    # Prefer scored primary persona if available
+    personas = entry.get("persona_scores", {})
+    primary = next((p for p, v in personas.items() if v.get("primary")), "")
+    if not primary:
+        primary = entry.get("detected_persona", "other")
+    return LABELS.get(primary, "🔗 Other")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # WRITE PATH  — lock, read FRESH inside lock, patch ONLY _tracking, atomic write
 # ─────────────────────────────────────────────────────────────────────────────
@@ -160,6 +178,38 @@ def update_status_on_disk(job_key: str, new_status: str) -> None:
 
     load_tracker.clear()                           # invalidate the cached read
 
+
+STALE_DAYS = 4   # jobs sitting in "New" longer than this are considered stale
+
+
+def archive_stale_jobs() -> int:
+    """Move all New jobs older than STALE_DAYS to Archived. Returns count moved."""
+    cutoff = date.today()
+    moved = 0
+    with LOCK:
+        tracker = json.loads(TRACKER_PATH.read_text(encoding="utf-8"))
+        for entry in tracker.values():
+            if not isinstance(entry, dict):
+                continue
+            trk = entry.get("_tracking", {})
+            if trk.get("application_status") != "New":
+                continue
+            first_seen_str = trk.get("first_seen", "")
+            try:
+                age = (cutoff - date.fromisoformat(first_seen_str)).days
+            except ValueError:
+                continue
+            if age >= STALE_DAYS:
+                trk["application_status"] = "Archived"
+                trk.setdefault("status_history", []).append(
+                    {"status": "Archived", "date": cutoff.isoformat()}
+                )
+                moved += 1
+        if moved:
+            _atomic_write(tracker)
+    if moved:
+        load_tracker.clear()
+    return moved
 
 def status_dropdown(entry: dict, scope: str) -> None:
     """Render a status <select> for one job. On change, persist + rerun.
@@ -260,29 +310,42 @@ def scoring_summary(entry: dict) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def render_job_card(entry: dict, scope: str, show_aging: bool = False) -> None:
-    om = entry.get("overall_match", {})
-    personas = entry.get("persona_scores", {})
-    primary = next((p for p, v in personas.items() if v.get("primary")), "—")
+    om      = entry.get("overall_match", {})
+    scored  = bool(om)
+    jtype   = classify_title(entry)
+    source  = entry.get("source", "")
 
     with st.container(border=True):
         top, ctrl = st.columns([4, 1])
         with top:
             st.markdown(f"**{entry.get('title','(untitled)')}** — "
                         f"{entry.get('company','?')}")
-            meta = f"📍 {entry.get('location','?')}  ·  💰 {entry.get('salary','Not listed')}"
-            meta += f"  ·  🎯 {om.get('score','?')}/10  ·  🧭 {primary.replace('_',' ')}"
+            meta = f"📍 {entry.get('location','?')}  ·  {jtype}"
+            if scored:
+                meta += f"  ·  🎯 {om.get('score','?')}/10"
+            if source:
+                meta += f"  ·  🔎 {source}"
             if show_aging:
                 meta += f"  ·  ⏳ saved {days_in_stage(entry)}d ago"
             st.caption(meta)
         with ctrl:
             status_dropdown(entry, scope)
 
-        aligns = entry.get("top_alignments", [])
-        gaps = entry.get("key_gaps", [])
-        if aligns:
-            st.markdown("✅ " + "  ·  ".join(aligns))
-        if gaps:
-            st.markdown("⚠️ " + "  ·  ".join(gaps))
+        if scored:
+            # Show Claude alignments & gaps when available
+            aligns = entry.get("top_alignments", [])
+            gaps   = entry.get("key_gaps", [])
+            if aligns:
+                st.markdown("✅ " + "  ·  ".join(aligns))
+            if gaps:
+                st.markdown("⚠️ " + "  ·  ".join(gaps))
+        else:
+            # Show description snippet when no scoring
+            desc = entry.get("description", "")
+            if desc:
+                snippet = desc[:220].strip().replace("\n", " ")
+                st.caption(snippet + ("…" if len(desc) > 220 else ""))
+
         if entry.get("url"):
             st.markdown(f"[↗ View / Apply]({entry['url']})")
 
@@ -331,35 +394,93 @@ tab_fire, tab_crm, tab_ai = st.tabs(
 # ── TAB 1: MORNING FIREHOSE  (status == New only) ───────────────────────────
 with tab_fire:
     new_jobs = by_status["New"]
+
+    # ── Stale jobs panel ────────────────────────────────────────────────────
+    stale = [j for j in new_jobs
+             if (TODAY - date.fromisoformat(
+                 tracking(j).get("first_seen", TODAY.isoformat())
+             )).days >= STALE_DAYS]
+
+    if stale:
+        sc1, sc2, sc3 = st.columns([2.5, 2, 2])
+        with sc1:
+            st.warning(f"⏰ {len(stale)} משרות ישנות (4+ ימים ב-New)")
+        with sc2:
+            if st.button("העבר משרות ישנות לארכיון"):
+                n = archive_stale_jobs()
+                st.success(f"הועברו {n} משרות לארכיון.")
+                st.rerun()
+        with sc3:
+            show_stale = st.toggle("הצג משרות ישנות בלבד", value=False)
+    else:
+        show_stale = False
+
+    st.divider()
+
     if not new_jobs:
         st.info("No new unactioned jobs. Run job_agent.py to scrape today's batch.")
     else:
-        high_med = [j for j in new_jobs
-                    if j.get("overall_match", {}).get("tier") in ("HIGH", "MEDIUM")]
-        low_count = len(new_jobs) - len(high_med)
-        caption = (f"{len(high_med)} jobs worth reviewing today. "
-                   "Set a status to move them into your pipeline or watchlist.")
-        if low_count:
-            caption += f"  ·  {low_count} LOW-match jobs hidden."
-        st.caption(caption)
+        # ── Controls row ────────────────────────────────────────────────────
+        f1, f2 = st.columns([2, 2])
 
-        for tier in ("HIGH", "MEDIUM"):
-            emoji, label = TIER_META[tier]
-            tier_jobs = [j for j in new_jobs
-                         if j.get("overall_match", {}).get("tier") == tier]
-            if not tier_jobs:
-                continue
-            # Primary sort: newest posting date first.
-            # Secondary sort: highest score first (tiebreaker within same date).
-            tier_jobs_sorted = sorted(
-                tier_jobs,
-                key=lambda x: (job_date(x), x.get("overall_match", {}).get("score", 0)),
-                reverse=True,
+        with f1:
+            persona_labels = {
+                "הכל":             "הכל",
+                "data_analyst":    "📊 Data / BI",
+                "product_manager": "🧩 Product",
+                "project_manager": "📋 Project / PMO",
+                "operations":      "⚙️ Operations",
+                "other":           "🔗 Other",
+            }
+            persona_filter = st.selectbox(
+                "סוג משרה",
+                options=list(persona_labels.keys()),
+                format_func=lambda x: persona_labels[x],
+                key="fire_persona",
             )
-            with st.expander(f"{emoji} {label}  ({len(tier_jobs)})",
-                             expanded=(tier == "HIGH")):
-                for j in tier_jobs_sorted:
-                    render_job_card(j, scope="fire")
+
+        with f2:
+            last_scrape_date = ""
+            if meta.get("last_scrape_completed"):
+                try:
+                    last_scrape_date = datetime.fromisoformat(
+                        meta["last_scrape_completed"]
+                    ).date().isoformat()
+                except ValueError:
+                    pass
+            last_run_only = st.toggle(
+                f"🔁 ריצה אחרונה בלבד ({last_scrape_date or '—'})",
+                value=False,
+                key="fire_lastrun",
+            )
+
+        # ── Apply filters ────────────────────────────────────────────────────
+        filtered = new_jobs
+
+        if show_stale:
+            filtered = stale
+        elif last_run_only and last_scrape_date:
+            filtered = [j for j in filtered
+                        if tracking(j).get("first_seen", "") == last_scrape_date]
+
+        if persona_filter != "הכל":
+            filtered = [j for j in filtered
+                        if classify_title(j) == persona_labels[persona_filter]]
+
+        # Sort by date (newest first) always
+        filtered = sorted(
+            filtered,
+            key=lambda x: job_date(x),
+            reverse=True,
+        )
+
+        # ── Render ───────────────────────────────────────────────────────────
+        if not filtered:
+            st.info("אין משרות שמתאימות לסינון הנוכחי.")
+        else:
+            st.caption(f"{len(filtered)} משרות מוצגות.")
+            for j in filtered:
+                render_job_card(j, scope="fire")
 
 # ── TAB 2: CAREER CRM  (Active pipeline + Watchlist) ────────────────────────
 with tab_crm:
@@ -398,36 +519,35 @@ with tab_ai:
     if not jobs:
         st.info("No jobs tracked yet.")
     else:
-        # Pick any tracked job (pipeline/watchlist jobs included, per spec —
-        # Stage 2 must work even for jobs saved weeks ago).
-        labelled = sorted(
-            jobs,
-            key=lambda x: x.get("overall_match", {}).get("score", 0), reverse=True,
-        )
-        options = {
-            f"{j.get('title','?')} — {j.get('company','?')} "
-            f"({j.get('overall_match',{}).get('score','?')}/10)": j
-            for j in labelled
-        }
-        choice = st.selectbox("Choose a job", list(options.keys()))
-        chosen = options[choice]
-
-        with st.container(border=True):
-            st.markdown(f"**{chosen.get('title','?')}** — {chosen.get('company','?')}")
-            st.caption(scoring_summary(chosen).replace("\n", "  ·  "))
-
-        # _snapshot is the offline JD cache — Stage 2 must NOT depend on the live
-        # URL, which is often dead weeks after the job was saved.
-        jd = chosen.get("_snapshot", {}).get("full_description", "")
-        job_key = chosen.get("job_key", "")
-
-        if not jd:
-            st.warning("No cached job description for this role — can't tailor. "
-                       "(It predates _snapshot caching.)")
-        elif st.button("✨ Tailor My CV for this Role", type="primary"):
-            briefing = get_tailoring(
-                job_key, jd, chosen.get("title", ""), chosen.get("company", ""),
-                scoring_summary(chosen),
+        # Only show jobs that have a cached JD snapshot — older entries that
+        # predate snapshot caching can't be tailored and are excluded here.
+        tailorable = [j for j in jobs if j.get("_snapshot", {}).get("full_description")]
+        if not tailorable:
+            st.info("No jobs with cached descriptions yet. Run job_agent.py first.")
+        else:
+            labelled = sorted(
+                tailorable,
+                key=lambda x: x.get("overall_match", {}).get("score", 0), reverse=True,
             )
-            st.markdown(briefing)
-            st.caption("💡 Cached for this role — re-opening won't re-bill the API.")
+            options = {
+                f"{j.get('title','?')} — {j.get('company','?')} "
+                f"({j.get('overall_match',{}).get('score','?')}/10)": j
+                for j in labelled
+            }
+            choice = st.selectbox("Choose a job", list(options.keys()))
+            chosen = options[choice]
+
+            with st.container(border=True):
+                st.markdown(f"**{chosen.get('title','?')}** — {chosen.get('company','?')}")
+                st.caption(scoring_summary(chosen).replace("\n", "  ·  "))
+
+            jd = chosen.get("_snapshot", {}).get("full_description", "")
+            job_key = chosen.get("job_key", "")
+
+            if st.button("✨ Tailor My CV for this Role", type="primary"):
+                briefing = get_tailoring(
+                    job_key, jd, chosen.get("title", ""), chosen.get("company", ""),
+                    scoring_summary(chosen),
+                )
+                st.markdown(briefing)
+                st.caption("💡 Cached for this role — re-opening won't re-bill the API.")

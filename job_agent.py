@@ -28,10 +28,13 @@ import os
 import shutil
 import tempfile
 import re
-from datetime import date
+import time
+from datetime import date, timedelta
 from pathlib import Path
 
 import anthropic
+import requests
+from bs4 import BeautifulSoup
 from filelock import FileLock
 from serpapi import GoogleSearch
 from jobspy import scrape_jobs
@@ -59,6 +62,46 @@ JD_TRUNCATE_CHARS = 6000  # cap each JD so one giant posting can't crowd a batch
 # the whole monthly API budget in one shot. Tune upward once daily volumes are
 # stable and predictable. At ~$0.01–0.02 per job, 60 ≈ $1 max per run.
 MAX_SCORE_PER_RUN = 60
+
+# Master switch for Claude scoring (Stage 1). Set to False to skip scoring
+# entirely and run the pipeline as a pure scraper + filter. Jobs will appear
+# in the dashboard without a score/tier — the dashboard shows a description
+# snippet and keyword-based job type instead. Flip back to True at any time;
+# existing unscored jobs will be picked up on the next run.
+SCORING_ENABLED = False
+
+# ── AllJobs (alljobs.co.il) ─────────────────────────────────────────────────
+# Israel's largest job board. Verified server-rendered (no JS rendering needed),
+# no bot protection, HTTP 200 on plain requests. Scraped with requests + BS4.
+ALLJOBS_ENABLED = False   # company field extraction unreliable → jobs dropped at dedup
+ALLJOBS_SLEEP   = 1.5   # seconds between page requests — be polite
+
+ALLJOBS_BASE = "https://www.alljobs.co.il/SearchResultsGuest.aspx"
+ALLJOBS_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "he-IL,he;q=0.9,en;q=0.8",
+}
+
+# Queries for AllJobs — mostly Hebrew since it's an Israeli site.
+# Kept to a focused subset so we don't hammer the server.
+ALLJOBS_QUERIES = [
+    "אנליסט נתונים",
+    "דאטה אנליסט",
+    "אנליסט עסקי",
+    "מנהל מוצר",
+    "אנליסט תפעול",
+    "מנהל פרויקטים",
+    "data analyst",
+    "business analyst",
+    "product manager",
+    "operations analyst",
+    "systems analyst",
+    "implementation specialist",
+]
 
 # Statuses whose jobs should NOT be re-scored or re-fed to the API.
 TERMINAL_STATUSES = {"Archived"}
@@ -486,6 +529,135 @@ def is_role_relevant(job: dict) -> bool:
     return any(tok in title for tok in RELEVANT_TITLE_TOKENS)
 
 
+def detect_persona(title: str) -> str:
+    """Keyword-based persona classification for display when scoring is disabled.
+    Returns one of: data_analyst | product_manager | project_manager |
+    operations | other. Stored on new jobs during merge so the dashboard can
+    filter by job type without a Claude call."""
+    t = title.lower()
+    if any(tok in t for tok in ["data", "analyst", "analytics", "bi", "intelligence",
+                                 "insight", "reporting", "אנליסט", "נתונים", "דאטה"]):
+        return "data_analyst"
+    if any(tok in t for tok in ["product", "מוצר"]):
+        return "product_manager"
+    if any(tok in t for tok in ["project", "pmo", "program", "פרויקט"]):
+        return "project_manager"
+    if any(tok in t for tok in ["operations", "ops", "supply chain",
+                                 "procurement", "logistics", "תפעול"]):
+        return "operations"
+    return "other"
+
+
+# ── AllJobs scraper ──────────────────────────────────────────────────────────
+
+def _parse_alljobs_date(text: str) -> str:
+    """Convert AllJobs Hebrew relative date to ISO. Falls back to TODAY."""
+    t = text.strip()
+    if "היום" in t or "עכשיו" in t:
+        return TODAY
+    if "אתמול" in t:
+        return (date.today() - timedelta(days=1)).isoformat()
+    m = re.search(r"לפני\s+(\d+)\s+ימים", t)
+    if m:
+        return (date.today() - timedelta(days=int(m.group(1)))).isoformat()
+    if "שבוע" in t:
+        return (date.today() - timedelta(days=7)).isoformat()
+    return TODAY
+
+
+def _parse_alljobs_box(box) -> dict | None:
+    """Parse one AllJobs job card into our standard schema."""
+    try:
+        # Title — skip closed jobs
+        title_div = box.find("div", class_=lambda c: c and "job-content-top-title" in c)
+        if not title_div:
+            return None
+        if "closed-job" in (title_div.get("class") or []):
+            return None
+        title = title_div.get_text(strip=True)
+        if not title:
+            return None
+
+        # Job ID → URL
+        jid_div = box.find("div", class_="jobid-hidden")
+        job_id  = jid_div.get_text(strip=True) if jid_div else ""
+        url = (f"https://www.alljobs.co.il/SingleJobN.aspx?JobId={job_id}"
+               if job_id else "")
+
+        # Location
+        loc_div  = box.find("div", class_=lambda c: c and "job-content-top-location" in c)
+        location = loc_div.get_text(strip=True) if loc_div else "Israel"
+
+        # Date posted
+        date_div   = box.find("div", class_="job-content-top-date")
+        date_text  = date_div.get_text(strip=True) if date_div else ""
+        date_posted = _parse_alljobs_date(date_text)
+
+        # Description
+        desc_div    = box.find("div", class_=lambda c: c and "job-content-top-desc" in c)
+        description = desc_div.get_text(strip=True) if desc_div else ""
+
+        # Company — look for employer page link first, then img alt
+        company = ""
+        for a in box.find_all("a", href=True):
+            if "Employer" in a["href"] or "employer" in a["href"]:
+                text = a.get_text(strip=True)
+                if text and len(text) > 1:
+                    company = text
+                    break
+        if not company:
+            for img in box.find_all("img"):
+                alt = img.get("alt", "").strip()
+                if alt and len(alt) > 2 and "logo" not in alt.lower():
+                    company = alt
+                    break
+
+        return {
+            "title":       title,
+            "company":     company,
+            "location":    location or "Israel",
+            "salary":      "Not listed",
+            "description": description[:JD_TRUNCATE_CHARS],
+            "url":         url,
+            "source":      "alljobs",
+            "date_posted": date_posted,
+            "job_level":   "",
+        }
+    except Exception:
+        return None
+
+
+def fetch_alljobs_jobs(query: str) -> list[dict]:
+    """Scrape AllJobs.co.il for the given query across ALLJOBS_PAGES pages.
+    Verified server-rendered, HTTP 200, no bot protection. Returns [] on any
+    failure so a bad query never breaks the whole run."""
+    results = []
+    for page in range(1, ALLJOBS_PAGES + 1):
+        try:
+            r = requests.get(
+                ALLJOBS_BASE,
+                params={"page": page, "position": query,
+                        "type": "", "city": "", "region": ""},
+                headers=ALLJOBS_HEADERS,
+                timeout=15,
+            )
+            if r.status_code != 200:
+                break
+            soup = BeautifulSoup(r.text, "html.parser")
+            boxes = soup.find_all("div", class_="job-box")
+            if not boxes:
+                break   # no more results
+            for box in boxes:
+                job = _parse_alljobs_box(box)
+                if job:
+                    results.append(job)
+            time.sleep(ALLJOBS_SLEEP)
+        except Exception as e:
+            log.warning("AllJobs fetch failed for '%s' page %d: %s", query, page, e)
+            break
+    return results
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. STABLE PRIMARY KEY  — MD5 of (company + title + location)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -535,6 +707,7 @@ def merge_into_tracker(tracker: dict, scraped: list[dict]) -> dict:
             # user_notes, stage2_ready, _snapshot, or any scoring fields.
         else:
             job["job_key"] = key
+            job["detected_persona"] = detect_persona(job.get("title", ""))
             job["_tracking"] = {
                 "application_status": "New",
                 "first_seen": TODAY,
@@ -667,6 +840,9 @@ def apply_scores(tracker: dict, scored: list[dict]) -> int:
 
 
 def score_all_unscored(tracker: dict) -> dict:
+    if not SCORING_ENABLED:
+        log.info("Scoring disabled (SCORING_ENABLED=False) — skipping Claude API.")
+        return tracker
     pending = [e for e in job_entries(tracker) if needs_scoring(e)]
     if not pending:
         log.info("Nothing to score — all jobs already evaluated.")
@@ -751,8 +927,16 @@ def run() -> None:
         # nothing). Indeed-IL / LinkedIn index Hebrew postings; verified working.
         for q in HEBREW_QUERIES:
             scraped += [normalize_job(j, "jobspy") for j in fetch_jobspy_jobs(q)]
-        log.info("Fetched %d raw postings across %d EN + %d HE queries.",
-                 len(scraped), len(SEARCH_QUERIES), len(HEBREW_QUERIES))
+
+        # AllJobs (alljobs.co.il) — Israel's largest job board. Server-rendered,
+        # no bot protection, scraped with requests + BeautifulSoup.
+        if ALLJOBS_ENABLED:
+            for q in ALLJOBS_QUERIES:
+                scraped += fetch_alljobs_jobs(q)
+
+        log.info("Fetched %d raw postings across %d EN + %d HE + %d AllJobs queries.",
+                 len(scraped), len(SEARCH_QUERIES), len(HEBREW_QUERIES),
+                 len(ALLJOBS_QUERIES) if ALLJOBS_ENABLED else 0)
 
         # Drop blanks that can't form a stable key.
         scraped = [j for j in scraped if j["company"] and j["title"]]

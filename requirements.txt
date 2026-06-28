@@ -6,6 +6,8 @@ filelock>=3.13.0           # cross-process lock shared by scraper + dashboard
 # Scraping stack
 python-jobspy>=1.1.70       # LinkedIn + Indeed direct scraping
 google-search-results>=2.4.2  # SerpApi client (import name: serpapi)
+requests>=2.31.0            # AllJobs HTTP scraping
+beautifulsoup4>=4.12.0      # AllJobs HTML parsing
 
 # Transitive but pinned for stability (jobspy returns DataFrames)
 pandas>=2.0.0
